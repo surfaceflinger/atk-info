@@ -9,10 +9,13 @@
  * (usage page 0xFF02), alongside the real 8k mouse report on the same interface.
  *
  * Because our id_table matches every interface of the device, we must bind and
- * drive them all like hid-generic would (HID_CONNECT_DEFAULT keeps mouse and
- * keyboard input working); we only additionally register a power_supply on the
- * interface that actually carries the 0x08 battery channel. Rejecting the other
- * interfaces with -ENODEV would leave them unbound and kill input.
+ * drive them all like hid-generic would (HID_CONNECT_DEFAULT keeps mouse
+ * input working); we only additionally register a power_supply on the
+ * interface that actually carries the 0x08 battery channel. The ghost
+ * boot-keyboard interface is the exception: it is bound raw-only so its
+ * input node doesn't make UPower misclassify the battery as a keyboard.
+ * Rejecting the other interfaces with -ENODEV would leave them unbound
+ * and kill input.
  *
  * Protocol (reverse-engineered by the projects referenced in the README):
  *
@@ -40,6 +43,7 @@
 #include <linux/power_supply.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/usb.h>
 #include <linux/workqueue.h>
 
 #define USB_VENDOR_ID_COMPX 0x373b
@@ -59,7 +63,14 @@
 
 #define ATK_REPLY_TIMEOUT_MS 300
 #define ATK_POLL_MIN_MS 1000
+#define ATK_POLL_RETRY_MS 5000
 #define ATK_FAIL_LIMIT 3
+
+/* A mouse cell is a single LiPo (~3.0-4.35V); anything far above that from
+ * an untrusted device is garbage or an error sentinel, so drop it while
+ * still reporting the (clamped) capacity.
+ */
+#define ATK_VOLTAGE_MAX_MV 10000
 
 static unsigned int poll_interval_ms = 120 * 1000;
 module_param(poll_interval_ms, uint, 0644);
@@ -75,8 +86,10 @@ static char *model_name;
 module_param(model_name, charp, 0444);
 MODULE_PARM_DESC(model_name, "Override the battery model name shown to UPower");
 
-/* Monotonic id for power_supply names; never reused, as in hid-logitech-hidpp,
- * so an unbinding device can't race a probing one for the same name.
+/* Monotonic id for power_supply names; unique among live devices, as in
+ * hid-logitech-hidpp, so an unbinding device can't race a probing one for
+ * the same name. (The counter resets on module reload, but rmmod implies
+ * every instance was already removed and unregistered.)
  */
 static atomic_t atk_battery_no = ATOMIC_INIT(0);
 
@@ -89,6 +102,7 @@ struct atk_battery {
 	const char *model;
 
 	spinlock_t lock; /* protects everything below */
+	bool dead; /* set by remove; polling work exits without rescheduling */
 	u8 resp[ATK_RESP_SIZE];
 	int resp_len;
 	u8 capacity;
@@ -106,7 +120,30 @@ static bool atk_has_battery_report(struct hid_device *hdev)
 {
 	struct hid_report_enum *out = &hdev->report_enum[HID_OUTPUT_REPORT];
 
-	return out->report_id_hash[ATK_REPORT_ID];
+	return out->report_id_hash[ATK_REPORT_ID] != NULL;
+}
+
+/* True for the ghost boot-keyboard interface these mouse dongles expose
+ * (USB boot subclass/protocol; shared firmware with ATK keyboards, silent
+ * while only a mouse is paired). Its input node carries ID_INPUT_KEYBOARD,
+ * and UPower prefers KEYBOARD over MOUSE among the sibling inputs sharing
+ * the same USB parent, so leaving it bound as input misclassifies the mouse
+ * battery as a keyboard. The vendor interface's own input has no
+ * ID_INPUT_KEYBOARD, so it keeps voting MOUSE once this one is gone.
+ * (If a real ATK keyboard is ever paired to one of these dongles its keys
+ * will not reach the input layer; revisit then.)
+ */
+static bool atk_is_ghost_keyboard(struct hid_device *hdev)
+{
+	struct usb_interface *intf;
+	struct usb_host_interface *alt;
+
+	if (!hid_is_usb(hdev))
+		return false;
+	intf = to_usb_interface(hdev->dev.parent);
+	alt = intf->cur_altsetting;
+	return alt->desc.bInterfaceSubClass == USB_INTERFACE_SUBCLASS_BOOT &&
+	       alt->desc.bInterfaceProtocol == USB_INTERFACE_PROTOCOL_KEYBOARD;
 }
 
 static void atk_build_query(u8 *buf)
@@ -126,18 +163,50 @@ static void atk_build_query(u8 *buf)
 	buf[ATK_PACKET_SIZE - 1] = ATK_CHECKSUM_TARGET - sum;
 }
 
-static int atk_send_query(struct hid_device *hdev, u8 *buf)
+static int atk_wait_reply(struct atk_battery *atk)
 {
-	int ret;
+	unsigned long t = msecs_to_jiffies(ATK_REPLY_TIMEOUT_MS);
 
-	/* Fall back to a SET_REPORT control transfer when the transport has no
-	 * output-report path, same as hidinput_led_worker().
+	return wait_for_completion_timeout(&atk->reply, t) ? 0 : -ETIMEDOUT;
+}
+
+static int atk_query_battery(struct atk_battery *atk, u8 *buf)
+{
+	struct hid_device *hdev = atk->hdev;
+	int power_ret, ret;
+
+	/* usbhid neither resumes the interface nor starts the interrupt-IN URB
+	 * for output_report/raw_request, so a query aimed at a runtime-suspended
+	 * device is silently dropped. hidraw holds PM_HINT_FULLON for its whole
+	 * session (hidraw_open()); we hold it around each poll instead.
 	 */
+	power_ret = hid_hw_power(hdev, PM_HINT_FULLON);
+	if (power_ret < 0)
+		return power_ret;
+
+	atk_build_query(buf);
+
+	reinit_completion(&atk->reply);
 	ret = hid_hw_output_report(hdev, buf, ATK_PACKET_SIZE);
-	if (ret == -ENOSYS)
+	if (ret < 0 || atk_wait_reply(atk)) {
+		/* A completed interrupt-OUT transfer does not imply the firmware
+		 * acted on the report: dongles that only honour control
+		 * SET_REPORT accept the bytes and answer nothing. Retry over the
+		 * control pipe instead of only on -ENOSYS.
+		 */
+		reinit_completion(&atk->reply);
 		ret = hid_hw_raw_request(hdev, buf[0], buf, ATK_PACKET_SIZE,
 					 HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
-	return ret;
+		if (ret >= 0 && atk_wait_reply(atk))
+			ret = -ETIMEDOUT;
+	}
+
+	hid_hw_power(hdev, PM_HINT_NORMAL);
+
+	/* hid_hw_output_report/raw_request return a byte count on success;
+	 * normalize to 0 so callers can test ret == 0 for success.
+	 */
+	return ret < 0 ? ret : 0;
 }
 
 static void atk_battery_poll(struct work_struct *work)
@@ -145,6 +214,7 @@ static void atk_battery_poll(struct work_struct *work)
 	struct atk_battery *atk =
 		container_of(to_delayed_work(work), struct atk_battery, work);
 	unsigned long flags;
+	unsigned long delay = msecs_to_jiffies(ATK_POLL_RETRY_MS);
 	bool changed = false;
 	u8 *buf;
 	int ret;
@@ -153,25 +223,22 @@ static void atk_battery_poll(struct work_struct *work)
 	if (!buf)
 		goto reschedule;
 
-	atk_build_query(buf);
-
-	reinit_completion(&atk->reply);
-	ret = atk_send_query(atk->hdev, buf);
-	if (ret < 0) {
-		hid_dbg(atk->hdev, "battery query send failed: %d\n", ret);
-	} else {
-		unsigned long t = msecs_to_jiffies(ATK_REPLY_TIMEOUT_MS);
-
-		ret = wait_for_completion_timeout(&atk->reply, t);
-		if (!ret)
-			hid_dbg(atk->hdev, "battery query timed out\n");
-	}
+	ret = atk_query_battery(atk, buf);
+	if (ret)
+		dev_warn_ratelimited(&atk->hdev->dev,
+				     "battery query failed: %d\n", ret);
 
 	spin_lock_irqsave(&atk->lock, flags);
-	if (ret > 0 && atk->resp_len >= ATK_RESP_MIN) {
+	if (ret == 0 && atk->resp_len >= ATK_RESP_MIN) {
 		u8 capacity = min_t(u8, atk->resp[6], 100);
 		bool charging = atk->resp[7] == 0x01;
 		u16 voltage_mv = (atk->resp[8] << 8) | atk->resp[9];
+
+		/* Implausible voltages from an untrusted device are dropped;
+		 * voltage 0 already reads back as -ENODATA below.
+		 */
+		if (voltage_mv > ATK_VOLTAGE_MAX_MV)
+			voltage_mv = 0;
 
 		changed = !atk->present || atk->capacity != capacity ||
 			  atk->charging != charging ||
@@ -192,19 +259,30 @@ static void atk_battery_poll(struct work_struct *work)
 			changed = true;
 		}
 	}
+
+	/* Until the mouse has answered once, keep retrying on a short delay: a
+	 * miss while the dongle is still linking leaves present=0 and fires no
+	 * uevent, so the battery would stay invisible for a whole interval.
+	 */
+	if (atk->present)
+		delay = msecs_to_jiffies(
+			max_t(unsigned int, poll_interval_ms, ATK_POLL_MIN_MS));
 	spin_unlock_irqrestore(&atk->lock, flags);
 
 	if (changed)
 		power_supply_changed(atk->psy);
 	kfree(buf);
 reschedule:
-	/* Freezable wq so polls pause across system suspend instead of racing
-	 * the suspending USB bus and logging spurious failures.
+	/* Never reschedule after remove(): cancel_delayed_work_sync() stops
+	 * pending and running instances, but a running instance that requeued
+	 * here would outlive the hid device and the devm-owned power_supply.
+	 * (Freezable wq so polls pause across system suspend instead of
+	 * racing the suspending USB bus and logging spurious failures.)
 	 */
-	queue_delayed_work(system_freezable_wq, &atk->work,
-			   msecs_to_jiffies(max_t(unsigned int,
-						  poll_interval_ms,
-						  ATK_POLL_MIN_MS)));
+	spin_lock_irqsave(&atk->lock, flags);
+	if (!atk->dead)
+		queue_delayed_work(system_freezable_wq, &atk->work, delay);
+	spin_unlock_irqrestore(&atk->lock, flags);
 }
 
 static int atk_info_raw_event(struct hid_device *hdev,
@@ -213,8 +291,13 @@ static int atk_info_raw_event(struct hid_device *hdev,
 	struct atk_battery *atk = hid_get_drvdata(hdev);
 	unsigned long flags;
 
-	/* atk is NULL on the plain mouse/keyboard interfaces; let the HID core
-	 * process their reports as usual.
+	/* atk is NULL on the plain mouse and raw-only ghost-keyboard
+	 * interfaces; let the HID core process their reports as usual.
+	 * Otherwise accept any report id 0x08 of sufficient length, exactly
+	 * like atk-tool does: the reply carries no reliable opcode echo to
+	 * key on, and this interface multiplexes no other 0x08 traffic on
+	 * the supported devices. A stray same-id report could at worst park
+	 * a clamped percentage here until the next poll overwrites it.
 	 */
 	if (!atk || size < ATK_RESP_MIN || data[0] != ATK_REPORT_ID)
 		return 0;
@@ -365,10 +448,18 @@ static int atk_info_probe(struct hid_device *hdev,
 	if (ret)
 		return ret;
 
-	/* Drive every interface like hid-generic so mouse/keyboard input keeps
-	 * working; only the vendor interface additionally gets a battery.
+	/* Drive every interface like hid-generic so mouse input keeps working;
+	 * only the vendor interface additionally gets a battery. The ghost
+	 * boot-keyboard interface is bound raw-only (hidraw still works, but
+	 * no input devices are created): it only exists for shared keyboard
+	 * firmware and its input node would make UPower report the battery
+	 * as a keyboard instead of a mouse. Motion lives on the plain mouse
+	 * interface, so nothing the user can feel changes.
 	 */
-	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+	if (atk_is_ghost_keyboard(hdev) && !atk_has_battery_report(hdev))
+		ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
+	else
+		ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
 	if (ret)
 		return ret;
 
@@ -391,6 +482,16 @@ static void atk_info_remove(struct hid_device *hdev)
 	struct atk_battery *atk = hid_get_drvdata(hdev);
 
 	if (atk) {
+		unsigned long flags;
+
+		/* Stop the poller first: it must observe dead before
+		 * cancel_delayed_work_sync() returns, otherwise a running
+		 * instance could reschedule itself onto a freed device.
+		 */
+		spin_lock_irqsave(&atk->lock, flags);
+		atk->dead = true;
+		spin_unlock_irqrestore(&atk->lock, flags);
+
 		cancel_delayed_work_sync(&atk->work);
 		hid_hw_close(hdev);
 	}
